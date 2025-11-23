@@ -1,357 +1,178 @@
-# ================================================
-# 📈 Multi-Timeframe Trading System (MTF)
-# ✅ ไฟล์: app.py
-# ------------------------------------------------
-# โค้ดนี้รวม Indicators, Swings, MMC, MTF Logic, EODHD API และ Streamlit UI
-# ================================================
-
-import pandas as pd
-import numpy as np
-import requests
-import matplotlib.pyplot as plt
 import streamlit as st
-import copy 
-import time
+import pandas as pd
+import yfinance as yf
+from datetime import date, timedelta
+import plotly.graph_objects as go
 
-# ================================================
-# 1️⃣ ฟังก์ชัน MTF Logic และ Indicators
-# ================================================
+# --- 1. CONFIGURATION ---
+st.set_page_config(layout="wide")
+st.title("✅ Multi-Timeframe Trading System (MTF)")
 
-# ----------------------------
-# Indicators
-# ----------------------------
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
+# Timeframe mapping for yfinance (LTF/HTF)
+# Note: yfinance has limitations, usually only up to 60 days of 1m data.
+YF_INTERVALS = {
+    "1T": "1m",
+    "5T": "5m",
+    "15T": "15m",
+    "30T": "30m",
+    "1H": "1h",
+    "1D": "1d",
+}
+# --- END CONFIGURATION ---
 
-def macd(close: pd.Series, fast=12, slow=26, signal=9):
-    ema_fast = ema(close, fast)
-    ema_slow = ema(close, slow)
-    dif = ema_fast - ema_slow
-    dea = dif.ewm(span=signal, adjust=False).mean()
-    hist = dif - dea
-    return pd.DataFrame({'DIF': dif, 'DEA': dea, 'MACD_HIST': hist})
 
-def add_indicators(df: pd.DataFrame,
-                   ema_spans=(50, 200),
-                   macd_params=(12, 26, 9),
-                   inplace=True):
-    df2 = df if inplace else df.copy()
-    if 'EMA50' not in df2.columns:
-        df2['EMA50'] = ema(df2['Close'], ema_spans[0])
-    if 'EMA200' not in df2.columns:
-        df2['EMA200'] = ema(df2['Close'], ema_spans[1])
-    need_macd = not {'DIF', 'DEA', 'MACD_HIST'}.issubset(df2.columns)
-    if need_macd:
-        macd_df = macd(df2['Close'], *macd_params)
-        df2[['DIF', 'DEA', 'MACD_HIST']] = macd_df
-    return df2
-
-# ----------------------------
-# Swings (Fractals) & Fibo Time
-# ----------------------------
-def find_swings(high: pd.Series, low: pd.Series, left=2, right=2):
-    n = len(high)
-    swing_high, swing_low = [], []
-    start_index = left
-    end_index = n - right
+# --- 2. DATA CACHING AND FETCHING (with Error Handling and Caching) ---
+@st.cache_data(show_spinner="กำลังดึงข้อมูลจาก yfinance...")
+def get_data(ticker, interval, start_date, end_date):
+    """
+    ดึงข้อมูล OHLCV จาก yfinance โดยมีการจัดการข้อผิดพลาด
+    """
+    if interval not in YF_INTERVALS:
+        return None, f"Error: Interval '{interval}' is not supported by yfinance."
     
-    if end_index <= start_index:
-        return [], []
-        
-    for i in range(start_index, end_index):
-        if high.iloc[i] == high.iloc[i-left:i+right+1].max():
-            swing_high.append(i)
-        if low.iloc[i] == low.iloc[i-left:i+right+1].min():
-            swing_low.append(i)
-    return swing_high, swing_low
-
-def bars_since_last_pivot(idx: int, swing_high: list, swing_low: list):
-    pivots = [p for p in swing_high + swing_low if p <= idx]
-    if not pivots:
-        return None
-    last = max(pivots)
-    return idx - last
-
-def fibo_time_pass(bars_since_pivot: int, fibo_set=(3,5,8,13,21), tolerance=0):
-    if bars_since_pivot is None:
-        return False
-    return any(abs(bars_since_pivot - f) <= tolerance for f in fibo_set)
-
-# ----------------------------
-# Hidden Divergence
-# ----------------------------
-def hidden_divergence(df: pd.DataFrame, use_hist=False, left=2, right=2):
-    if len(df) < left + right + 1:
-        return {'hidden_bull': False, 'hidden_bear': False, 'last_swing_low_idx': None, 'last_swing_high_idx': None}
-        
-    osc = df['MACD_HIST'] if use_hist else df['DIF']
-    swing_h, swing_l = find_swings(df['High'], df['Low'], left=left, right=right)
-
-    hidden_bull = False
-    if len(swing_l) >= 2:
-        i1, i2 = swing_l[-2], swing_l[-1]
-        price_hl = df['Low'].iloc[i2] > df['Low'].iloc[i1]
-        osc_ll = osc.iloc[i2] < osc.iloc[i1]
-        hidden_bull = bool(price_hl and osc_ll)
-
-    hidden_bear = False
-    if len(swing_h) >= 2:
-        j1, j2 = swing_h[-2], swing_h[-1]
-        price_lh = df['High'].iloc[j2] < df['High'].iloc[j1]
-        osc_hh = osc.iloc[j2] > osc.iloc[j1]
-        hidden_bear = bool(price_lh and osc_hh)
-
-    return {'hidden_bull': hidden_bull, 'hidden_bear': hidden_bear,
-            'last_swing_low_idx': swing_l[-1] if swing_l else None,
-            'last_swing_high_idx': swing_h[-1] if swing_h else None}
-
-# ----------------------------
-# MMC (3 Confirm)
-# ----------------------------
-def check_3_confirm(df: pd.DataFrame,
-                    fibo_set=(3,5,8,13,21),
-                    fibo_tol=0,
-                    ema_source='EMA200'):
-    if len(df) < 2:
-        return 0, 0, {}
-        
-    if ema_source not in df.columns or not {'DIF','DEA'}.issubset(df.columns):
-         add_indicators(df, inplace=True)
-         
-    t, t1 = len(df) - 1, len(df) - 2
-    latest, prev = df.iloc[t], df.iloc[t1]
-    
-    ms_buy = (latest['Close'] > latest[ema_source]) and (prev['Close'] <= prev[ema_source])
-    ms_sell = (latest['Close'] < latest[ema_source]) and (prev['Close'] >= prev[ema_source])
-    macd_buy = (latest['DIF'] > latest['DEA']) and (prev['DIF'] <= prev['DEA'])
-    macd_sell = (latest['DIF'] < latest['DEA']) and (prev['DIF'] >= prev['DEA'])
-    
-    swing_h, swing_l = find_swings(df['High'], df['Low'], left=2, right=2)
-    bslp = bars_since_last_pivot(t, swing_h, swing_l)
-    fibo_ok = fibo_time_pass(bslp, fibo_set=fibo_set, tolerance=fibo_tol)
-    
-    confirms_buy = sum([ms_buy, macd_buy, fibo_ok])
-    confirms_sell = sum([ms_sell, macd_sell, fibo_ok])
-
-    return confirms_buy, confirms_sell, {
-        'ms_buy': ms_buy, 'ms_sell': ms_sell,
-        'macd_buy': macd_buy, 'macd_sell': macd_sell,
-        'fibo_ok': fibo_ok, 'bars_since_last_pivot': bslp
-    }
-
-# ----------------------------
-# HTF Filter
-# ----------------------------
-def htf_filter_30m(df30: pd.DataFrame,
-                   ema_spans=(50,200),
-                   macd_params=(12,26,9),
-                   min_bars_above_below=3):
-    add_indicators(df30, ema_spans=ema_spans, macd_params=macd_params, inplace=True)
-    if len(df30) < min_bars_above_below:
-        return False, False, {}
-    n = min_bars_above_below
-    last_n = df30.iloc[-n:]
-    
-    cond_trend_up = (last_n['Close'] > last_n['EMA200']).all()
-    cond_ema_align_up = df30['EMA50'].iloc[-1] > df30['EMA200'].iloc[-1]
-    cond_momentum_up = (df30['DIF'].iloc[-1] > df30['DEA'].iloc[-1]) or (df30['MACD_HIST'].iloc[-1] > 0)
-    htf_up = bool(cond_trend_up and cond_ema_align_up and cond_momentum_up)
-    
-    cond_trend_down = (last_n['Close'] < last_n['EMA200']).all()
-    cond_ema_align_down = df30['EMA50'].iloc[-1] < df30['EMA200'].iloc[-1]
-    cond_momentum_down = (df30['DIF'].iloc[-1] < df30['DEA'].iloc[-1]) or (df30['MACD_HIST'].iloc[-1] < 0)
-    htf_down = bool(cond_trend_down and cond_ema_align_down and cond_momentum_down)
-    
-    details = {
-        'trend_up_last_n_above_ema200': cond_trend_up, 'ema_align_up': cond_ema_align_up, 'momentum_up': cond_momentum_up,
-        'trend_down_last_n_below_ema200': cond_trend_down, 'ema_align_down': cond_ema_align_down, 'momentum_down': cond_momentum_down,
-    }
-    return htf_up, htf_down, details
-
-# ----------------------------
-# Resample OHLC
-# ----------------------------
-def resample_ohlc(df: pd.DataFrame, rule: str):
-    ohlc = df.resample(rule).agg({
-        'Open': 'first', 'High': 'max', 'Low': 'min',
-        'Close': 'last', 'Volume': 'sum'
-    }).dropna(subset=['Close'])
-    return ohlc
-
-# ----------------------------
-# MTF Signal Core Logic
-# ----------------------------
-def mtf_signal(df_raw: pd.DataFrame,
-               tf_exec='15T', tf_filter='30T',
-               ema_spans=(50,200), macd_params=(12,26,9),
-               fibo_set=(3,5,8,13,21), fibo_tol=0,
-               min_bars_htf=3, use_hidden=True):
-    df15 = resample_ohlc(df_raw, tf_exec)
-    df30 = resample_ohlc(df_raw, tf_filter)
-    
-    if len(df15) < 2 or len(df30) < 2:
-        return {'price_15m': df_raw['Close'].iloc[-1] if not df_raw.empty else None, 
-                'action': "HOLD/WAIT", 'reasons': ['Not enough bars for calculation']}
-
-    add_indicators(df15, ema_spans=ema_spans, macd_params=macd_params)
-    add_indicators(df30, ema_spans=ema_spans, macd_params=macd_params)
-    
-    htf_up, htf_down, htf_det = htf_filter_30m(df30, ema_spans, macd_params, min_bars_htf)
-    c_buy, c_sell, mmc_det = check_3_confirm(df15, fibo_set, fibo_tol, 'EMA200')
-    hidden_det = hidden_divergence(df15) if use_hidden else {'hidden_bull': False, 'hidden_bear': False}
-    
-    action, reason = "HOLD/WAIT", []
-    if htf_up and c_buy >= 2:
-        action = "BUY: Confirmed (MTF aligned)"
-        if c_buy == 3: action = "BUY: ALL-IN (3/3, MTF aligned)"
-        if use_hidden and hidden_det.get('hidden_bull'): reason.append('Hidden Bullish boost')
-    elif htf_down and c_sell >= 2:
-        action = "SELL: Confirmed (MTF aligned)"
-        if c_sell == 3: action = "SELL: ALL-IN (3/3, MTF aligned)"
-        if use_hidden and hidden_det.get('hidden_bear'): reason.append('Hidden Bearish boost')
-    else:
-        if not htf_up and not htf_down: reason.append('30m filter not aligned')
-        if c_buy < 2 and c_sell < 2: reason.append('15m MMC < 2/3')
-        
-    latest15 = df15.iloc[-1]
-    return {
-        'time': str(latest15.name),
-        'price_15m': float(latest15['Close']),
-        'BUY_confirms_15m': c_buy,
-        'SELL_confirms_15m': c_sell,
-        'action': action,
-        'reasons': reason,
-        'htf_details': htf_det,
-        'mmc_details_15m': mmc_det,
-        'hidden_div_15m': hidden_det
-    }
-
-# ------------------------------------------------
-# 2️⃣ EODHD Data Fetcher (with Streamlit Cache)
-# ------------------------------------------------
-@st.cache_data(ttl=600) # Cache data for 10 minutes
-def get_intraday_data(ticker, interval, api_token):
-    url = f"https://eodhd.com/api/intraday/{ticker}?interval={interval}&api_token={api_token}&fmt=json"
+    yf_interval = YF_INTERVALS[interval]
     
     try:
-        r = requests.get(url, timeout=30)
-        r.raise_for_status()
-        data = r.json()
+        data = yf.download(
+            tickers=ticker,
+            start=start_date,
+            end=end_date,
+            interval=yf_interval,
+            progress=False
+        )
         
-        if not data:
-             return pd.DataFrame()
-             
-        df = pd.DataFrame(data)
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low',
-                                'close': 'Close', 'volume': 'Volume'})
-        df = df.set_index('datetime')
-        return df
+        # ตรวจสอบว่ามีข้อมูลหรือไม่
+        if data.empty:
+            return None, f"Error: ไม่พบข้อมูลสำหรับ '{ticker}' ในช่วงวันที่และ Timeframe ที่เลือก กรุณาตรวจสอบ Ticker, ช่วงวันที่ และ Timeframe (yfinance มักจำกัด 1m ที่ 60 วันย้อนหลัง)."
         
-    except requests.exceptions.HTTPError as http_err:
-        st.error(f"HTTP Error: API returned status {r.status_code}. Please check your EODHD API usage or token.")
-    except requests.exceptions.RequestException as e:
-        st.error(f"Connection Error: Could not connect to EODHD API. Check network.")
+        # เปลี่ยนชื่อคอลัมน์ให้เป็นมาตรฐาน
+        data.columns = [col.capitalize() for col in data.columns]
+        
+        # ลบคอลัมน์ที่ Streamlit ไม่ต้องการ
+        if 'Adj Close' in data.columns:
+            data = data.drop(columns=['Adj Close'])
+
+        return data, None
+    
     except Exception as e:
-        st.error(f"An unexpected error occurred: {e}")
-        
-    return pd.DataFrame()
+        # แจ้งเตือนข้อผิดพลาด API
+        return None, f"API Error: การเรียก yfinance ล้มเหลว อาจเกิดจาก Ticker ไม่ถูกต้อง หรือปัญหาการเชื่อมต่อ: {e}"
 
 
-# ------------------------------------------------
-# 3️⃣ Plotting Function
-# ------------------------------------------------
-def plot_mtf_result(df, result, ticker):
-    fig, ax = plt.subplots(figsize=(10, 5))
-    df_plot = df.copy()
+# --- 3. MULTI-TIMEFRAME ANALYSIS AND PLOTTING ---
+
+def analyze_and_plot(data_ltf, filter_timeframe_str):
+    """
+    ทำการวิเคราะห์ MTF และสร้างกราฟเชิงโต้ตอบด้วย Plotly
+    """
     
-    # Ensure indicators are calculated for plotting
-    add_indicators(df_plot, inplace=True)
+    # 3.1 Resample (สร้างข้อมูล HTF/Filter)
+    # ใช้วิธีการ Resample มาตรฐานสำหรับ OHLCV
+    htf_data = data_ltf['Close'].resample(filter_timeframe_str).last().to_frame(name='Filter_Close')
+    htf_data['Filter_Open'] = data_ltf['Open'].resample(filter_timeframe_str).first()
+    htf_data['Filter_High'] = data_ltf['High'].resample(filter_timeframe_str).max()
+    htf_data['Filter_Low'] = data_ltf['Low'].resample(filter_timeframe_str).min()
     
-    ax.plot(df_plot['Close'], label='Close Price', color='gray', alpha=0.7)
-    ax.plot(df_plot['EMA50'], label='EMA50', color='orange')
-    ax.plot(df_plot['EMA200'], label='EMA200', color='blue')
+    # 3.2 Add Simple Filter (SMA) - สำหรับตัวอย่าง
+    # คำนวณ Simple Moving Average (SMA) 200 บน HTF
+    htf_data['Filter_SMA'] = htf_data['Filter_Close'].rolling(window=200).mean()
+
+    # 3.3 Merge Filter Data back to LTF
+    # นำสัญญาณ Filter (SMA) จาก HTF กลับมาใส่ในข้อมูล LTF
+    # ffill จะเติมค่าไปข้างหน้าจนกว่าจะมีการสร้างแท่ง HTF ใหม่
+    data_ltf['Filter_SMA'] = htf_data['Filter_SMA'].ffill() 
+
+    # 3.4 Plotly Chart (กราฟแบบโต้ตอบ)
+    fig = go.Figure()
+
+    # Candlestick Chart (LTF)
+    fig.add_trace(go.Candlestick(
+        x=data_ltf.index,
+        open=data_ltf['Open'],
+        high=data_ltf['High'],
+        low=data_ltf['Low'],
+        close=data_ltf['Close'],
+        name=f'LTF Price ({st.session_state.ltf})',
+        increasing_line_color='#00CC00',
+        decreasing_line_color='#FF0000'
+    ))
+
+    # Filter Line (HTF SMA)
+    fig.add_trace(go.Scatter(
+        x=data_ltf.index,
+        y=data_ltf['Filter_SMA'],
+        line=dict(color='yellow', width=2),
+        name=f'HTF Filter (200 SMA on {st.session_state.htf})'
+    ))
+
+    # Layout Customization
+    fig.update_layout(
+        title=f"MTF Analysis: {st.session_state.ticker} | LTF: {st.session_state.ltf} vs HTF Filter: {st.session_state.htf}",
+        xaxis_rangeslider_visible=False, # ซ่อนตัวเลื่อนด้านล่าง
+        xaxis_title="Time",
+        yaxis_title="Price",
+        hovermode="x unified",
+        height=700
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
     
-    ax.set_title(f"Price Action & EMAs for {ticker} (1-Min Data)", fontsize=14)
-    ax.set_ylabel("Price")
-    ax.legend()
-    ax.grid(True, linestyle='--', alpha=0.6)
-    
-    st.pyplot(fig)
+    # แสดงข้อมูลดิบ (เพื่อดีบัก)
+    st.subheader("ข้อมูลดิบ (LTF) พร้อม Filter")
+    st.dataframe(data_ltf.tail(200))
 
 
-# ------------------------------------------------
-# 4️⃣ Streamlit UI / Main Application
-# ------------------------------------------------
-def main():
-    st.set_page_config(page_title="MTF Trading Signal Analyzer", layout="wide")
-    st.title("📈 Multi-Timeframe Trading System (MTF)")
-    st.markdown("---")
+# --- 4. STREAMLIT UI ---
+
+# 4.1 Sidebar: Settings & Data Source
+st.sidebar.header("Settings & Data Source")
+
+# Ticker Symbol
+ticker = st.sidebar.text_input("Ticker Symbol (e.g., AAPL, BTC-USD)", "AAPL", key="ticker").upper()
+
+# Date Range Selection (NEW FEATURE)
+today = date.today()
+default_start = today - timedelta(days=59) # yfinance 1m limit is about 60 days
+
+date_col1, date_col2 = st.sidebar.columns(2)
+
+with date_col1:
+    start_date = st.date_input("Start Date", default_start)
+
+with date_col2:
+    end_date = st.date_input("End Date", today)
+
+# Execution Timeframe (LTF)
+ltf_options = list(YF_INTERVALS.keys())
+ltf = st.sidebar.selectbox("Execution Timeframe (LTF)", ltf_options, index=ltf_options.index("5T"), key="ltf")
+
+# Filter Timeframe (HTF)
+# HTF ต้องมีค่ามากกว่า LTF
+htf_options = ltf_options[ltf_options.index(ltf):] 
+htf = st.sidebar.selectbox("Filter Timeframe (HTF)", htf_options, index=htf_options.index("30T"), key="htf")
+
+# Run Button
+if st.sidebar.button("Run MTF Analysis"):
+    st.session_state.run_analysis = True
+
+# 4.2 Main Area: Run Analysis
+if st.session_state.get('run_analysis', False):
     
-    # ดึง API Key จาก Streamlit Secrets (ปลอดภัยบน Cloud)
-    if "eodhd_api_key" in st.secrets:
-        api_token = st.secrets["eodhd_api_key"]
+    # 4.2.1 Data Fetching
+    data_ltf, error_message = get_data(ticker, ltf, start_date, end_date)
+    
+    if error_message:
+        # แสดงข้อผิดพลาด API/Data Error
+        st.error(f"❌ Analysis Failed: {error_message}")
     else:
-        st.warning("EODHD API Key not found in Streamlit Secrets. Running in 'demo' mode. Results may be limited.")
-        api_token = "demo" 
-
-    # Sidebar: User Inputs
-    st.sidebar.header("⚙️ Settings & Data Source")
-    ticker = st.sidebar.text_input("Ticker Symbol (e.g., AAPL.US, BTC-USD)", "AAPL.US")
-    tf_exec = st.sidebar.selectbox("Execution Timeframe (LTF)", options=['15T', '10T', '5T'], index=0)
-    tf_filter = st.sidebar.selectbox("Filter Timeframe (HTF)", options=['30T', '60T'], index=0)
-
-    # ปุ่ม Run
-    if st.sidebar.button("Run MTF Analysis"):
-        if not ticker:
-            st.warning("Please enter Ticker Symbol.")
-            return
-        
-        # 1. ดึงข้อมูล
-        with st.spinner(f"Fetching 1-Minute data for {ticker}..."):
-            df_raw = get_intraday_data(ticker, "1m", api_token)
-
-        if df_raw.empty or len(df_raw) < 200:
-            st.error("Not enough historical data (min 200 bars recommended). Please try again later.")
-            return
-        
-        # 2. รันการวิเคราะห์ MTF
-        with st.spinner("Calculating MTF Signals..."):
-            result = mtf_signal(copy.deepcopy(df_raw), 
-                                tf_exec=tf_exec, 
-                                tf_filter=tf_filter)
-        
-        st.subheader(f"✅ Analysis Result for {ticker} (Time: {result.get('time', 'N/A')})")
-        
-        # 3. แสดงผลลัพธ์หลัก
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Current 15m Close Price", f"${result['price_15m']:.2f}" if result['price_15m'] else "N/A")
-        
-        if 'BUY' in result['action']:
-            color = 'green'
-        elif 'SELL' in result['action']:
-            color = 'red'
-        else:
-            color = 'orange'
+        # 4.2.2 Check Data Size
+        if data_ltf.shape[0] < 200:
+            st.warning(f"⚠️ คำเตือน: ข้อมูลที่ดึงมามีเพียง {data_ltf.shape[0]} แถว ซึ่งน้อยกว่า 200 แถวที่แนะนำ อาจทำให้การวิเคราะห์ Filter (SMA) ไม่แม่นยำ")
             
-        col2.markdown(f"**MTF Action:** <span style='color:{color}; font-size: 24px;'>{result['action']}</span>", unsafe_allow_html=True)
-        col3.metric("15m Confirms (Buy/Sell)", f"{result['BUY_confirms_15m']} / {result['SELL_confirms_15m']}")
-
-        st.markdown(f"**Reasons:** {' | '.join(result['reasons'])}")
-
-        st.markdown("---")
-
-        # 4. แสดงกราฟ
-        st.subheader("📊 Price Chart & Indicators (1-Minute)")
-        plot_mtf_result(df_raw, result, ticker)
-        
-        # 5. แสดงรายละเอียดเชิงลึก
-        st.subheader("📚 Detailed Confirmation Breakdown")
-        st.markdown("#### 30m Filter (HTF) Status")
-        st.json(result['htf_details'])
-        st.markdown("#### 15m MMC (3 Confirms) Status")
-        st.json(result['mmc_details_15m'])
-
-
-if __name__ == "__main__":
-    main()
+        # 4.2.3 Analysis and Plotting
+        try:
+            analyze_and_plot(data_ltf, htf)
+        except Exception as plot_e:
+            st.error(f"❌ เกิดข้อผิดพลาดในการวิเคราะห์หรือสร้างกราฟ: {plot_e}. กรุณาตรวจสอบช่วงวันที่หรือ Timeframe.")
+            
+# --- END CODE ---
