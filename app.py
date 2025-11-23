@@ -1,192 +1,165 @@
+code_content = '''
 import streamlit as st
 import pandas as pd
-import requests
-from datetime import date, timedelta
-import plotly.graph_objects as go
 import numpy as np
+import plotly.graph_objects as go
+import MetaTrader5 as mt5
+import time
+from datetime import datetime
 
-# --- 1. CONFIGURATION ---
+# --- CONFIGURATION ---
 st.set_page_config(layout="wide")
-st.title("✅ Multi-Timeframe Trading System (MTF) - Alpha Vantage")
+st.title("📊 MTF Trading Analyzer (MetaTrader 5)")
 
-# Timeframe mapping for Alpha Vantage (LTF/HTF)
-# Alpha Vantage API uses '1min', '5min', etc. for TIME_SERIES_INTRADAY
-AV_INTERVALS = {
-    "1T": "1min",
-    "5T": "5min",
-    "15T": "15min",
-    "30T": "30min",
-    "1H": "60min",
-    # Note: 1D is not supported by the TIME_SERIES_INTRADAY function
+# Timeframe mapping for MetaTrader 5
+MT5_TIMEFRAME_MAP = {
+    "1T": mt5.TIMEFRAME_M1, "5T": mt5.TIMEFRAME_M5, "15T": mt5.TIMEFRAME_M15,
+    "30T": mt5.TIMEFRAME_M30, "1H": mt5.TIMEFRAME_H1, "4H": mt5.TIMEFRAME_H4,
 }
 
-# --- END CONFIGURATION ---
+# --- DATA FETCHING ---
+@st.cache_data(show_spinner="⏳ กำลังเชื่อมต่อและดึงข้อมูลจาก MetaTrader 5...")
+def get_data(ticker, interval_str, count):
+    if interval_str not in MT5_TIMEFRAME_MAP:
+        return None, f"Error: Interval '{interval_str}' ไม่รองรับ"
+    timeframe = MT5_TIMEFRAME_MAP[interval_str]
 
+    if not mt5.initialize():
+        return None, f"❌ MT5 Connection Failed: ตรวจสอบว่า MT5 Terminal เปิดอยู่. Error: {mt5.last_error()}"
 
-# --- 2. DATA CACHING AND FETCHING (Alpha Vantage) ---
-@st.cache_data(show_spinner="กำลังดึงข้อมูลจาก Alpha Vantage...")
-def get_data(ticker, interval, output_size):
-    """
-    ดึงข้อมูล OHLCV จาก Alpha Vantage (TIME_SERIES_INTRADAY)
-    """
-    if interval not in AV_INTERVALS:
-        return None, f"Error: Interval '{interval}' is not supported by Alpha Vantage Intraday."
-    
-    av_interval = AV_INTERVALS[interval]
-    
-    # ดึง API Key จาก Streamlit Secrets
-    try:
-        api_key = st.secrets["ALPHA_VANTAGE_API_KEY"]
-    except KeyError:
-        return None, "Configuration Error: ไม่พบ API Key ของ Alpha Vantage ใน Streamlit Secrets"
+    if not mt5.symbol_info(ticker):
+        mt5.shutdown()
+        return None, f"❌ Symbol Error: ไม่พบ Symbol '{ticker}' ใน Market Watch"
 
-    # สร้าง URL สำหรับ API call
-    url = (
-        f'https://www.alphavantage.co/query?'
-        f'function=TIME_SERIES_INTRADAY&'
-        f'symbol={ticker}&'
-        f'interval={av_interval}&'
-        f'outputsize={output_size}&' # 'compact' (100 bars) or 'full' (all history)
-        f'apikey={api_key}'
-    )
-    
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status() # ตรวจสอบ HTTP errors
-        data_json = response.json()
-        
-        # ตรวจสอบข้อผิดพลาด API (เช่น Limit Reached, Invalid Ticker)
-        if "Error Message" in data_json:
-            return None, f"Alpha Vantage API Error: {data_json['Error Message']}"
-        if "Note" in data_json and "limit" in data_json['Note']:
-            return None, f"API Limit Reached: กรุณารอ 1 นาที หรือพิจารณาอัปเกรดแผนบริการ"
+    rates = mt5.copy_rates_from_pos(ticker, timeframe, 0, count)
+    mt5.shutdown()
 
-        # ค้นหา Key ที่เป็น Time Series (เช่น 'Time Series (5min)')
-        time_series_key = next((key for key in data_json.keys() if 'Time Series' in key), None)
-        
-        if not time_series_key:
-            return None, "Data Error: Alpha Vantage ไม่พบข้อมูล Time Series สำหรับ Ticker นี้"
+    if rates is None or rates.size == 0:
+        return None, f"❌ Data Error: ไม่สามารถดึงข้อมูลสำหรับ {ticker}"
 
-        # แปลง JSON เป็น DataFrame
-        raw_data = data_json[time_series_key]
-        df = pd.DataFrame.from_dict(raw_data, orient='index').astype(float)
-        
-        # จัดรูปแบบ DataFrame
-        df.index = pd.to_datetime(df.index)
-        df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-        df = df.sort_index() # เรียงจากเก่าไปใหม่
-        
-        return df, None
-    
-    except requests.exceptions.HTTPError as http_err:
-        return None, f"HTTP Error: การเรียก Alpha Vantage ล้มเหลว ({http_err})"
-    except Exception as e:
-        return None, f"General Error: เกิดข้อผิดพลาดในการดึงข้อมูล: {e}"
+    df = pd.DataFrame(rates)
+    df.index = pd.to_datetime(df['time'], unit='s')
+    df.columns = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Spread', 'Real_Volume']
+    df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+    return df, None
 
+# --- LIVE SIGNAL ---
+def get_live_signal_state(ticker, current_sma_filter):
+    if not mt5.initialize():
+        return None, "MT5 Initialization Failed"
+    tick_info = mt5.symbol_info_tick(ticker)
+    mt5.shutdown()
 
-# --- 3. MULTI-TIMEFRAME ANALYSIS AND PLOTTING ---
-# (ใช้ฟังก์ชันเดิมได้ เพราะรับ DataFrame ที่จัดรูปแบบเหมือนกัน)
+    if tick_info is None or tick_info.last == 0:
+        return None, "ไม่สามารถดึง Tick Data ล่าสุดได้"
+
+    latest_price = tick_info.last if tick_info.last > 0 else tick_info.bid
+
+    signal_state = ""
+    if latest_price > current_sma_filter:
+        signal_state = "⬆️ BULLISH - ราคาอยู่เหนือ Filter"
+    elif latest_price < current_sma_filter:
+        signal_state = "⬇️ BEARISH - ราคาอยู่ใต้ Filter"
+    else:
+        signal_state = "⏸️ NEUTRAL - ราคาทับ Filter"
+
+    time_str = datetime.fromtimestamp(tick_info.time).strftime('%Y-%m-%d %H:%M:%S')
+
+    return {"time": time_str, "price": latest_price, "signal": signal_state, "sma": current_sma_filter}, None
+
+# --- ANALYSIS AND PLOT ---
 def analyze_and_plot(data_ltf, filter_timeframe_str):
-    """
-    ทำการวิเคราะห์ MTF และสร้างกราฟเชิงโต้ตอบด้วย Plotly
-    """
-    
-    # 3.1 Resample (สร้างข้อมูล HTF/Filter)
     htf_data = data_ltf['Close'].resample(filter_timeframe_str).last().to_frame(name='Filter_Close')
     htf_data['Filter_Open'] = data_ltf['Open'].resample(filter_timeframe_str).first()
     htf_data['Filter_High'] = data_ltf['High'].resample(filter_timeframe_str).max()
     htf_data['Filter_Low'] = data_ltf['Low'].resample(filter_timeframe_str).min()
-    
-    # 3.2 Add Simple Filter (SMA) - คำนวณ Simple Moving Average (SMA) 200 บน HTF
     htf_data['Filter_SMA'] = htf_data['Filter_Close'].rolling(window=200).mean()
 
-    # 3.3 Merge Filter Data back to LTF
-    data_ltf['Filter_SMA'] = htf_data['Filter_SMA'].ffill() 
+    data_ltf['Filter_SMA'] = htf_data['Filter_SMA'].ffill()
 
-    # 3.4 Plotly Chart (กราฟแบบโต้ตอบ)
     fig = go.Figure()
-
-    # Candlestick Chart (LTF)
-    fig.add_trace(go.Candlestick(
-        x=data_ltf.index,
-        open=data_ltf['Open'],
-        high=data_ltf['High'],
-        low=data_ltf['Low'],
-        close=data_ltf['Close'],
-        name=f'LTF Price ({st.session_state.ltf})',
-        increasing_line_color='#00CC00',
-        decreasing_line_color='#FF0000'
-    ))
-
-    # Filter Line (HTF SMA)
-    fig.add_trace(go.Scatter(
-        x=data_ltf.index,
-        y=data_ltf['Filter_SMA'],
-        line=dict(color='yellow', width=2),
-        name=f'HTF Filter (200 SMA on {st.session_state.htf})'
-    ))
-
-    # Layout Customization
-    fig.update_layout(
-        title=f"MTF Analysis: {st.session_state.ticker} | LTF: {st.session_state.ltf} vs HTF Filter: {st.session_state.htf}",
-        xaxis_rangeslider_visible=False,
-        xaxis_title="Time",
-        yaxis_title="Price",
-        hovermode="x unified",
-        height=700
-    )
-
+    fig.add_trace(go.Candlestick(x=data_ltf.index, open=data_ltf['Open'], high=data_ltf['High'],
+                                  low=data_ltf['Low'], close=data_ltf['Close'],
+                                  name=f'LTF Price ({st.session_state.ltf})',
+                                  increasing_line_color='#00CC00', decreasing_line_color='#FF0000'))
+    fig.add_trace(go.Scatter(x=data_ltf.index, y=data_ltf['Filter_SMA'],
+                             line=dict(color='yellow', width=2),
+                             name=f'HTF Filter (200 SMA on {st.session_state.htf})'))
+    fig.update_layout(title=f"Candlestick Chart: {st.session_state.ticker} | LTF: {st.session_state.ltf}",
+                      xaxis_rangeslider_visible=False, height=650,
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     st.plotly_chart(fig, use_container_width=True)
-    
-    # แสดงข้อมูลดิบ (เพื่อดีบัก)
-    st.subheader("ข้อมูลดิบ (LTF) พร้อม Filter")
-    st.dataframe(data_ltf.tail(200))
+    return data_ltf['Filter_SMA'].iloc[-1]
 
-
-# --- 4. STREAMLIT UI ---
-
-# 4.1 Sidebar: Settings & Data Source
-st.sidebar.header("Settings & Data Source")
-
-# Ticker Symbol
-ticker = st.sidebar.text_input("Ticker Symbol (e.g., AAPL, TSLA)", "AAPL", key="ticker").upper()
-
-# Alpha Vantage Intraday only provides up to 100 bars (compact) or all history (full).
-# We set it to 'full' for wider history, but be aware of the 5 calls/minute limit.
-output_size = 'full' 
-
-# Execution Timeframe (LTF)
-ltf_options = list(AV_INTERVALS.keys())
+# --- STREAMLIT UI ---
+st.sidebar.header("⚙️ Settings & Parameters")
+ticker = st.sidebar.text_input("Ticker Symbol", "EURUSD", key="ticker").upper()
+bars_count = st.sidebar.number_input("จำนวนแท่งเทียน LTF (200-10000)", min_value=200, max_value=10000, value=5000, step=100, key="bars_count")
+ltf_options = list(MT5_TIMEFRAME_MAP.keys())
 ltf = st.sidebar.selectbox("Execution Timeframe (LTF)", ltf_options, index=ltf_options.index("5T"), key="ltf")
-
-# Filter Timeframe (HTF)
 ltf_index = ltf_options.index(ltf)
-htf_options_filtered = ltf_options[ltf_index:] 
+htf_options_filtered = ltf_options[ltf_index:]
 default_htf_index = htf_options_filtered.index("30T") if "30T" in htf_options_filtered else 0
 htf = st.sidebar.selectbox("Filter Timeframe (HTF)", htf_options_filtered, index=default_htf_index, key="htf")
 
-# Run Button
-if st.sidebar.button("Run MTF Analysis"):
+st.sidebar.markdown("---")
+if st.sidebar.button("▶️ RUN MTF ANALYSIS"):
     st.session_state.run_analysis = True
 
-# 4.2 Main Area: Run Analysis
 if st.session_state.get('run_analysis', False):
-    
-    # 4.2.1 Data Fetching
-    # Alpha Vantage TIME_SERIES_INTRADAY doesn't use start/end date inputs directly
-    data_ltf, error_message = get_data(ticker, ltf, output_size)
-    
+    data_ltf, error_message = get_data(ticker, ltf, int(st.session_state.bars_count))
     if error_message:
         st.error(f"❌ Analysis Failed: {error_message}")
+        st.session_state.run_analysis = False
     else:
-        # 4.2.2 Check Data Size
         if data_ltf.shape[0] < 200:
-            st.warning(f"⚠️ คำเตือน: ข้อมูลที่ดึงมามีเพียง {data_ltf.shape[0]} แถว ซึ่งน้อยกว่า 200 แถวที่แนะนำ อาจทำให้การวิเคราะห์ Filter (SMA) ไม่แม่นยำ")
-            
-        # 4.2.3 Analysis and Plotting
+            st.warning(f"⚠️ ข้อมูลมีเพียง {data_ltf.shape[0]} แถว อาจทำให้ SMA ไม่แม่น")
         try:
-            analyze_and_plot(data_ltf, htf)
+            latest_sma = analyze_and_plot(data_ltf, htf)
         except Exception as plot_e:
-            st.error(f"❌ เกิดข้อผิดพลาดในการวิเคราะห์หรือสร้างกราฟ: {plot_e}. ตรวจสอบ Timeframe หรือลองใช้ Ticker อื่น.")
-            
-# --- END CODE ---
+            st.error(f"❌ เกิดข้อผิดพลาด: {plot_e}")
+            latest_sma = None
+
+        st.markdown("---")
+        tab_live, tab_raw = st.tabs(["🔴 Live Signal Monitor", "📋 Raw Data (LTF)"])
+        with tab_live:
+            if latest_sma is not None:
+                st.subheader(f"🔴 Live Signal Monitor - {ticker}")
+                if 'live_running' not in st.session_state:
+                    st.session_state.live_running = False
+                col_start, col_status = st.columns([1, 4])
+                if col_start.button("🟢 Start Live Check", key="btn_start_live"):
+                    st.session_state.live_running = True
+                if col_start.button("🛑 Stop Live Check", key="btn_stop_live"):
+                    st.session_state.live_running = False
+                live_container = st.empty()
+                if st.session_state.live_running:
+                    while st.session_state.live_running:
+                        live_data, live_error = get_live_signal_state(ticker, latest_sma)
+                        if live_error:
+                            col_status.error(f"Live Check Error: {live_error}")
+                            st.session_state.live_running = False
+                            break
+                        with live_container.container():
+                            st.markdown(f"### **Current Filter: <span style='color:yellow;'>{latest_sma:.5f}</span>**", unsafe_allow_html=True)
+                            col_price, col_delta, col_time = st.columns([1.5, 1, 1])
+                            col_price.metric("ราคาปัจจุบัน", f"{live_data['price']:.5f}", f"{live_data['price'] - latest_sma:.5f}")
+                            signal_color = 'green' if 'BULLISH' in live_data['signal'] else ('red' if 'BEARISH' in live_data['signal'] else 'gray')
+                            col_delta.markdown(f"### สัญญาณ")
+                            col_delta.markdown(f"<p style='font-size:30px; color:{signal_color};'><b>{live_data['signal']}</b></p>", unsafe_allow_html=True)
+                            col_time.markdown(f"### อัปเดตล่าสุด")
+                            col_time.markdown(f"<p style='font-size:20px;'>{live_data['time']}</p>", unsafe_allow_html=True)
+                        time.sleep(1)
+                else:
+                    col_status.info("Live Monitoring หยุดทำงานแล้ว")
+            else:
+                st.warning("⚠️ ไม่สามารถแสดง Live Signal ได้ เนื่องจากไม่สามารถคำนวณ Filter SMA ได้")
+        with tab_raw:
+            st.subheader(f"Raw Data (LTF: {ltf})")
+            st.dataframe(data_ltf.tail(200), use_container_width=True)
+'''
+
+with open('mtf_trading_analyzer_fixed.py', 'w') as f:
+    f.write(code_content)
+
+print("✅ ไฟล์ mtf_trading_analyzer_fixed.py ถูกสร้างเรียบร้อยแล้ว")
