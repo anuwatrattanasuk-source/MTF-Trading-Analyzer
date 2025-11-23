@@ -1,89 +1,106 @@
 import streamlit as st
 import pandas as pd
-import yfinance as yf
+import requests
 from datetime import date, timedelta
 import plotly.graph_objects as go
+import numpy as np
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(layout="wide")
-st.title("✅ Multi-Timeframe Trading System (MTF)")
+st.title("✅ Multi-Timeframe Trading System (MTF) - Alpha Vantage")
 
-# Timeframe mapping for yfinance (LTF/HTF)
-YF_INTERVALS = {
-    "1T": "1m",
-    "5T": "5m",
-    "15T": "15m",
-    "30T": "30m",
-    "1H": "1h",
-    "1D": "1d",
+# Timeframe mapping for Alpha Vantage (LTF/HTF)
+# Alpha Vantage API uses '1min', '5min', etc. for TIME_SERIES_INTRADAY
+AV_INTERVALS = {
+    "1T": "1min",
+    "5T": "5min",
+    "15T": "15min",
+    "30T": "30min",
+    "1H": "60min",
+    # Note: 1D is not supported by the TIME_SERIES_INTRADAY function
 }
+
 # --- END CONFIGURATION ---
 
 
-# --- 2. DATA CACHING AND FETCHING (with Error Handling and Caching) ---
-@st.cache_data(show_spinner="กำลังดึงข้อมูลจาก yfinance...")
-def get_data(ticker, interval, start_date, end_date):
+# --- 2. DATA CACHING AND FETCHING (Alpha Vantage) ---
+@st.cache_data(show_spinner="กำลังดึงข้อมูลจาก Alpha Vantage...")
+def get_data(ticker, interval, output_size):
     """
-    ดึงข้อมูล OHLCV จาก yfinance โดยมีการจัดการข้อผิดพลาด
+    ดึงข้อมูล OHLCV จาก Alpha Vantage (TIME_SERIES_INTRADAY)
     """
-    if interval not in YF_INTERVALS:
-        return None, f"Error: Interval '{interval}' is not supported by yfinance."
+    if interval not in AV_INTERVALS:
+        return None, f"Error: Interval '{interval}' is not supported by Alpha Vantage Intraday."
     
-    yf_interval = YF_INTERVALS[interval]
+    av_interval = AV_INTERVALS[interval]
+    
+    # ดึง API Key จาก Streamlit Secrets
+    try:
+        api_key = st.secrets["ALPHA_VANTAGE_API_KEY"]
+    except KeyError:
+        return None, "Configuration Error: ไม่พบ API Key ของ Alpha Vantage ใน Streamlit Secrets"
+
+    # สร้าง URL สำหรับ API call
+    url = (
+        f'https://www.alphavantage.co/query?'
+        f'function=TIME_SERIES_INTRADAY&'
+        f'symbol={ticker}&'
+        f'interval={av_interval}&'
+        f'outputsize={output_size}&' # 'compact' (100 bars) or 'full' (all history)
+        f'apikey={api_key}'
+    )
     
     try:
-        data = yf.download(
-            tickers=ticker,
-            start=start_date,
-            end=end_date,
-            interval=yf_interval,
-            progress=False
-        )
+        response = requests.get(url, timeout=10)
+        response.raise_for_status() # ตรวจสอบ HTTP errors
+        data_json = response.json()
         
-        # *** ส่วนที่แก้ไข: เพิ่มการตรวจสอบ isinstance(data, pd.DataFrame) ***
-        if not isinstance(data, pd.DataFrame):
-             # ถ้า data ไม่ใช่ DataFrame (เช่น เป็น tuple ที่มี Error Message)
-             return None, f"Error: Ticker '{ticker}' ไม่ถูกต้อง, ไม่มีข้อมูล, หรือช่วงวันที่ยาวเกินไปสำหรับ Timeframe '{interval}'"
+        # ตรวจสอบข้อผิดพลาด API (เช่น Limit Reached, Invalid Ticker)
+        if "Error Message" in data_json:
+            return None, f"Alpha Vantage API Error: {data_json['Error Message']}"
+        if "Note" in data_json and "limit" in data_json['Note']:
+            return None, f"API Limit Reached: กรุณารอ 1 นาที หรือพิจารณาอัปเกรดแผนบริการ"
 
-        # ตรวจสอบว่ามีข้อมูลภายในหรือไม่
-        if data.empty:
-            return None, f"Error: ไม่พบข้อมูลสำหรับ '{ticker}' ในช่วงวันที่ที่เลือก กรุณาลองช่วงวันที่สั้นลง"
+        # ค้นหา Key ที่เป็น Time Series (เช่น 'Time Series (5min)')
+        time_series_key = next((key for key in data_json.keys() if 'Time Series' in key), None)
         
-        # เปลี่ยนชื่อคอลัมน์ให้เป็นมาตรฐาน
-        data.columns = [col.capitalize() for col in data.columns]
-        
-        # ลบคอลัมน์ที่ Streamlit ไม่ต้องการ
-        if 'Adj Close' in data.columns:
-            data = data.drop(columns=['Adj Close'])
+        if not time_series_key:
+            return None, "Data Error: Alpha Vantage ไม่พบข้อมูล Time Series สำหรับ Ticker นี้"
 
-        return data, None
+        # แปลง JSON เป็น DataFrame
+        raw_data = data_json[time_series_key]
+        df = pd.DataFrame.from_dict(raw_data, orient='index').astype(float)
+        
+        # จัดรูปแบบ DataFrame
+        df.index = pd.to_datetime(df.index)
+        df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        df = df.sort_index() # เรียงจากเก่าไปใหม่
+        
+        return df, None
     
+    except requests.exceptions.HTTPError as http_err:
+        return None, f"HTTP Error: การเรียก Alpha Vantage ล้มเหลว ({http_err})"
     except Exception as e:
-        # แจ้งเตือนข้อผิดพลาด API
-        return None, f"API Error: การเรียก yfinance ล้มเหลว อาจเกิดจาก Ticker ไม่ถูกต้อง หรือปัญหาการเชื่อมต่อ: {e}"
+        return None, f"General Error: เกิดข้อผิดพลาดในการดึงข้อมูล: {e}"
 
 
 # --- 3. MULTI-TIMEFRAME ANALYSIS AND PLOTTING ---
-
+# (ใช้ฟังก์ชันเดิมได้ เพราะรับ DataFrame ที่จัดรูปแบบเหมือนกัน)
 def analyze_and_plot(data_ltf, filter_timeframe_str):
     """
     ทำการวิเคราะห์ MTF และสร้างกราฟเชิงโต้ตอบด้วย Plotly
     """
     
     # 3.1 Resample (สร้างข้อมูล HTF/Filter)
-    # ใช้วิธีการ Resample มาตรฐานสำหรับ OHLCV
     htf_data = data_ltf['Close'].resample(filter_timeframe_str).last().to_frame(name='Filter_Close')
     htf_data['Filter_Open'] = data_ltf['Open'].resample(filter_timeframe_str).first()
     htf_data['Filter_High'] = data_ltf['High'].resample(filter_timeframe_str).max()
     htf_data['Filter_Low'] = data_ltf['Low'].resample(filter_timeframe_str).min()
     
-    # 3.2 Add Simple Filter (SMA) - สำหรับตัวอย่าง
-    # คำนวณ Simple Moving Average (SMA) 200 บน HTF
+    # 3.2 Add Simple Filter (SMA) - คำนวณ Simple Moving Average (SMA) 200 บน HTF
     htf_data['Filter_SMA'] = htf_data['Filter_Close'].rolling(window=200).mean()
 
     # 3.3 Merge Filter Data back to LTF
-    # นำสัญญาณ Filter (SMA) จาก HTF กลับมาใส่ในข้อมูล LTF
-    # ffill จะเติมค่าไปข้างหน้าจนกว่าจะมีการสร้างแท่ง HTF ใหม่
     data_ltf['Filter_SMA'] = htf_data['Filter_SMA'].ffill() 
 
     # 3.4 Plotly Chart (กราฟแบบโต้ตอบ)
@@ -112,7 +129,7 @@ def analyze_and_plot(data_ltf, filter_timeframe_str):
     # Layout Customization
     fig.update_layout(
         title=f"MTF Analysis: {st.session_state.ticker} | LTF: {st.session_state.ltf} vs HTF Filter: {st.session_state.htf}",
-        xaxis_rangeslider_visible=False, # ซ่อนตัวเลื่อนด้านล่าง
+        xaxis_rangeslider_visible=False,
         xaxis_title="Time",
         yaxis_title="Price",
         hovermode="x unified",
@@ -132,29 +149,19 @@ def analyze_and_plot(data_ltf, filter_timeframe_str):
 st.sidebar.header("Settings & Data Source")
 
 # Ticker Symbol
-ticker = st.sidebar.text_input("Ticker Symbol (e.g., AAPL, BTC-USD)", "AAPL", key="ticker").upper()
+ticker = st.sidebar.text_input("Ticker Symbol (e.g., AAPL, TSLA)", "AAPL", key="ticker").upper()
 
-# Date Range Selection (NEW FEATURE)
-today = date.today()
-default_start = today - timedelta(days=59) # yfinance 1m limit is about 60 days
-
-date_col1, date_col2 = st.sidebar.columns(2)
-
-with date_col1:
-    start_date = st.date_input("Start Date", default_start)
-
-with date_col2:
-    end_date = st.date_input("End Date", today)
+# Alpha Vantage Intraday only provides up to 100 bars (compact) or all history (full).
+# We set it to 'full' for wider history, but be aware of the 5 calls/minute limit.
+output_size = 'full' 
 
 # Execution Timeframe (LTF)
-ltf_options = list(YF_INTERVALS.keys())
+ltf_options = list(AV_INTERVALS.keys())
 ltf = st.sidebar.selectbox("Execution Timeframe (LTF)", ltf_options, index=ltf_options.index("5T"), key="ltf")
 
 # Filter Timeframe (HTF)
-# HTF ต้องมีค่ามากกว่า LTF
 ltf_index = ltf_options.index(ltf)
 htf_options_filtered = ltf_options[ltf_index:] 
-# Ensure "30T" is available, if not, use the next available one
 default_htf_index = htf_options_filtered.index("30T") if "30T" in htf_options_filtered else 0
 htf = st.sidebar.selectbox("Filter Timeframe (HTF)", htf_options_filtered, index=default_htf_index, key="htf")
 
@@ -166,10 +173,10 @@ if st.sidebar.button("Run MTF Analysis"):
 if st.session_state.get('run_analysis', False):
     
     # 4.2.1 Data Fetching
-    data_ltf, error_message = get_data(ticker, ltf, start_date, end_date)
+    # Alpha Vantage TIME_SERIES_INTRADAY doesn't use start/end date inputs directly
+    data_ltf, error_message = get_data(ticker, ltf, output_size)
     
     if error_message:
-        # แสดงข้อผิดพลาด API/Data Error
         st.error(f"❌ Analysis Failed: {error_message}")
     else:
         # 4.2.2 Check Data Size
@@ -180,6 +187,6 @@ if st.session_state.get('run_analysis', False):
         try:
             analyze_and_plot(data_ltf, htf)
         except Exception as plot_e:
-            st.error(f"❌ เกิดข้อผิดพลาดในการวิเคราะห์หรือสร้างกราฟ: {plot_e}. กรุณาตรวจสอบช่วงวันที่หรือ Timeframe.")
+            st.error(f"❌ เกิดข้อผิดพลาดในการวิเคราะห์หรือสร้างกราฟ: {plot_e}. ตรวจสอบ Timeframe หรือลองใช้ Ticker อื่น.")
             
 # --- END CODE ---
