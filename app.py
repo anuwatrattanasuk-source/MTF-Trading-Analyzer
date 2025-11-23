@@ -9,7 +9,6 @@ st.set_page_config(layout="wide")
 st.title("✅ Multi-Timeframe Trading System (MTF)")
 
 # Timeframe mapping for yfinance (LTF/HTF)
-# Note: yfinance has limitations, usually only up to 60 days of 1m data.
 YF_INTERVALS = {
     "1T": "1m",
     "5T": "5m",
@@ -41,9 +40,14 @@ def get_data(ticker, interval, start_date, end_date):
             progress=False
         )
         
-        # ตรวจสอบว่ามีข้อมูลหรือไม่
+        # *** ส่วนที่แก้ไข: เพิ่มการตรวจสอบ isinstance(data, pd.DataFrame) ***
+        if not isinstance(data, pd.DataFrame):
+             # ถ้า data ไม่ใช่ DataFrame (เช่น เป็น tuple ที่มี Error Message)
+             return None, f"Error: Ticker '{ticker}' ไม่ถูกต้อง, ไม่มีข้อมูล, หรือช่วงวันที่ยาวเกินไปสำหรับ Timeframe '{interval}'"
+
+        # ตรวจสอบว่ามีข้อมูลภายในหรือไม่
         if data.empty:
-            return None, f"Error: ไม่พบข้อมูลสำหรับ '{ticker}' ในช่วงวันที่และ Timeframe ที่เลือก กรุณาตรวจสอบ Ticker, ช่วงวันที่ และ Timeframe (yfinance มักจำกัด 1m ที่ 60 วันย้อนหลัง)."
+            return None, f"Error: ไม่พบข้อมูลสำหรับ '{ticker}' ในช่วงวันที่ที่เลือก กรุณาลองช่วงวันที่สั้นลง"
         
         # เปลี่ยนชื่อคอลัมน์ให้เป็นมาตรฐาน
         data.columns = [col.capitalize() for col in data.columns]
@@ -148,8 +152,11 @@ ltf = st.sidebar.selectbox("Execution Timeframe (LTF)", ltf_options, index=ltf_o
 
 # Filter Timeframe (HTF)
 # HTF ต้องมีค่ามากกว่า LTF
-htf_options = ltf_options[ltf_options.index(ltf):] 
-htf = st.sidebar.selectbox("Filter Timeframe (HTF)", htf_options, index=htf_options.index("30T"), key="htf")
+ltf_index = ltf_options.index(ltf)
+htf_options_filtered = ltf_options[ltf_index:] 
+# Ensure "30T" is available, if not, use the next available one
+default_htf_index = htf_options_filtered.index("30T") if "30T" in htf_options_filtered else 0
+htf = st.sidebar.selectbox("Filter Timeframe (HTF)", htf_options_filtered, index=default_htf_index, key="htf")
 
 # Run Button
 if st.sidebar.button("Run MTF Analysis"):
